@@ -257,6 +257,9 @@ class GRPOTrainer(Trainer):
     ):
         self.logger = logging.getLogger(__name__)
 
+        if "model_name" in kwargs:
+            self.model_name = kwargs["model_name"]
+
         # Models
         if peft_config is not None:
             model = get_peft_model(model, peft_config)  # type: ignore
@@ -859,6 +862,8 @@ class GRPOTrainer(Trainer):
 
     def _get_model_name(self) -> str:
         """Get model name for Environment generation."""
+        if hasattr(self, "model_name"):
+            return self.model_name
         return self.model.config._name_or_path  # type: ignore
 
     def _ids_to_tensors(
@@ -1135,12 +1140,22 @@ class GRPOTrainer(Trainer):
                     all_completion_ids=broadcast_data["completion_ids"],
                     all_prompt_mask=broadcast_data["prompt_mask"],
                 )
+            with torch.no_grad():
+                completion_mask = attention_mask[:, 1:]
+                logits_to_keep = completion_mask.size(1)
+                old_per_token_logps = self._get_per_token_logps(
+                    self.model,
+                    input_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size=self.per_device_train_batch_size,
+                )
 
             # Concatenate all data for shuffling
             full_batch = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "old_per_token_logps": None,
+                "old_per_token_logps": old_per_token_logps,
                 "advantages": advantages,
             }
 
@@ -1266,6 +1281,9 @@ class GRPOTrainer(Trainer):
         clip_ratio = (is_region_clipped * completion_mask).sum() / completion_mask.sum()
 
         gathered_low_clip = self.accelerator.gather_for_metrics(low_clip)
+        gathered_coef = self.accelerator.gather_for_metrics(coef_1)
+        self._metrics[mode]["clip_ratio/ratio_max"].append(gathered_coef.max().item())
+        self._metrics[mode]["clip_ratio/ratio_min"].append(gathered_coef.min().item())
         self._metrics[mode]["clip_ratio/low_mean"].append(
             gathered_low_clip.nanmean().item()  # type: ignore
         )
